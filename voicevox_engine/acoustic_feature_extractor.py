@@ -1,5 +1,4 @@
 from abc import abstractmethod
-from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import List, Sequence
@@ -7,21 +6,20 @@ from typing import List, Sequence
 import numpy
 
 
-@dataclass
-class SamplingData:
-    array: numpy.ndarray  # shape: (N, ?)
-    rate: float
-
-    def resample(self, sampling_rate: float, index: int = 0, length: int = None):
-        if length is None:
-            length = int(len(self.array) / self.rate * sampling_rate)
-        indexes = (numpy.random.rand() + index + numpy.arange(length)) * (
-            self.rate / sampling_rate
-        )
-        return self.array[indexes.astype(int)]
-
-
 class BasePhoneme(object):
+    """
+    音素の応用クラス群の抽象基底クラス
+
+    Attributes
+    ----------
+    phoneme_list : Sequence[str]
+        音素のリスト
+    num_phoneme : int
+        音素リストの要素数
+    space_phoneme : str
+        読点に値する音素
+    """
+
     phoneme_list: Sequence[str]
     num_phoneme: int
     space_phoneme: str
@@ -45,18 +43,42 @@ class BasePhoneme(object):
         )
 
     def verify(self):
+        """
+        音素クラスとして、データが正しいかassertする
+        """
         assert self.phoneme in self.phoneme_list, f"{self.phoneme} is not defined."
 
     @property
     def phoneme_id(self):
+        """
+        phoneme_id (phoneme list内でのindex)を取得する
+        Returns
+        -------
+        id : int
+            phoneme_idを返す
+        """
         return self.phoneme_list.index(self.phoneme)
 
     @property
     def duration(self):
+        """
+        音素継続期間を取得する
+        Returns
+        -------
+        duration : int
+            音素継続期間を返す
+        """
         return self.end - self.start
 
     @property
     def onehot(self):
+        """
+        phoneme listの長さ分の0埋め配列のうち、phoneme id番目がTrue(1)の配列を返す
+        Returns
+        -------
+        onehot : numpu.ndarray
+            関数内で変更された配列を返す
+        """
         array = numpy.zeros(self.num_phoneme, dtype=bool)
         array[self.phoneme_id] = True
         return array
@@ -64,6 +86,19 @@ class BasePhoneme(object):
     @classmethod
     def parse(cls, s: str):
         """
+        文字列をパースして音素クラスを作る
+        Parameters
+        ----------
+        s : str
+            パースしたい文字列
+
+        Returns
+        -------
+        phoneme : BasePhoneme
+            パース結果を用いた音素クラスを返す
+
+        Examples
+        --------
         >>> BasePhoneme.parse('1.7425000 1.9125000 o:')
         Phoneme(phoneme='o:', start=1.74, end=1.91)
         """
@@ -77,10 +112,22 @@ class BasePhoneme(object):
     @classmethod
     @abstractmethod
     def convert(cls, phonemes: List["BasePhoneme"]) -> List["BasePhoneme"]:
-        pass
+        raise NotImplementedError
 
     @classmethod
-    def load_julius_list(cls, path: Path):
+    def load_lab_list(cls, path: Path):
+        """
+        labファイルを読み込む
+        Parameters
+        ----------
+        path : Path
+            読み込みたいlabファイルのパス
+
+        Returns
+        -------
+        phonemes : List[BasePhoneme]
+            パース結果を用いた音素クラスを返す
+        """
         phonemes = [cls.parse(s) for s in path.read_text().split("\n") if len(s) > 0]
         phonemes = cls.convert(phonemes)
 
@@ -89,7 +136,16 @@ class BasePhoneme(object):
         return phonemes
 
     @classmethod
-    def save_julius_list(cls, phonemes: List["BasePhoneme"], path: Path):
+    def save_lab_list(cls, phonemes: List["BasePhoneme"], path: Path):
+        """
+        音素クラスのリストをlabファイル形式で保存する
+        Parameters
+        ----------
+        phonemes : List[BasePhoneme]
+            保存したい音素クラスのリスト
+        path : Path
+            labファイルの保存先パス
+        """
         text = "\n".join(
             [
                 f"{numpy.round(p.start, decimals=2):.2f}\t"
@@ -102,6 +158,19 @@ class BasePhoneme(object):
 
 
 class JvsPhoneme(BasePhoneme):
+    """
+    JVS(Japanese versatile speech)コーパスに含まれる音素群クラス
+
+    Attributes
+    ----------
+    phoneme_list : Sequence[str]
+        音素のリスト
+    num_phoneme : int
+        音素リストの要素数
+    space_phoneme : str
+        読点に値する音素
+    """
+
     phoneme_list = (
         "pau",
         "I",
@@ -147,7 +216,19 @@ class JvsPhoneme(BasePhoneme):
     space_phoneme = "pau"
 
     @classmethod
-    def convert(cls, phonemes: List["JvsPhoneme"]):
+    def convert(cls, phonemes: List["JvsPhoneme"]) -> List["JvsPhoneme"]:
+        """
+        最初と最後のsil(silent)をspace_phoneme(pau)に置き換え(変換)する
+        Parameters
+        ----------
+        phonemes : List[JvsPhoneme]
+            変換したいphonemeのリスト
+
+        Returns
+        -------
+        phonemes : List[JvsPhoneme]
+            変換されたphonemeのリスト
+        """
         if "sil" in phonemes[0].phoneme:
             phonemes[0].phoneme = cls.space_phoneme
         if "sil" in phonemes[-1].phoneme:
@@ -156,6 +237,19 @@ class JvsPhoneme(BasePhoneme):
 
 
 class OjtPhoneme(BasePhoneme):
+    """
+    OpenJTalkに含まれる音素群クラス
+
+    Attributes
+    ----------
+    phoneme_list : Sequence[str]
+        音素のリスト
+    num_phoneme : int
+        音素リストの要素数
+    space_phoneme : str
+        読点に値する音素
+    """
+
     phoneme_list = (
         "pau",
         "A",
@@ -208,6 +302,18 @@ class OjtPhoneme(BasePhoneme):
 
     @classmethod
     def convert(cls, phonemes: List["OjtPhoneme"]):
+        """
+        最初と最後のsil(silent)をspace_phoneme(pau)に置き換え(変換)する
+        Parameters
+        ----------
+        phonemes : List[OjtPhoneme]
+            変換したいphonemeのリスト
+
+        Returns
+        -------
+        phonemes : List[OjtPhoneme]
+            変換されたphonemeのリスト
+        """
         if "sil" in phonemes[0].phoneme:
             phonemes[0].phoneme = cls.space_phoneme
         if "sil" in phonemes[-1].phoneme:
