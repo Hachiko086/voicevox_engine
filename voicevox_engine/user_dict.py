@@ -1,63 +1,29 @@
 import json
-import shutil
 import sys
 import threading
 import traceback
-from logging import getLogger
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import Dict, List, Optional
 from uuid import UUID, uuid4
 
 import numpy as np
 import pyopenjtalk
-import requests
 from fastapi import HTTPException
 from pydantic import conint
 
 from .model import UserDictWord, WordTypes
 from .part_of_speech_data import MAX_PRIORITY, MIN_PRIORITY, part_of_speech_data
-from .utility import delete_file, engine_root, get_save_dir, mutex_wrapper
+from .utility import engine_root, get_save_dir, mutex_wrapper
 
 root_dir = engine_root()
 save_dir = get_save_dir()
-logger = getLogger("uvicorn")
-
-telemetry_gas_url: Optional[str] = None
 
 if not save_dir.is_dir():
     save_dir.mkdir(parents=True)
 
 default_dict_path = root_dir / "default.csv"
 user_dict_path = save_dir / "user_dict.json"
-shared_dict_path = save_dir / "shared_dict.json"
 compiled_dict_path = save_dir / "user.dic"
-
-
-def fetch_telemetry_gas_url() -> None:
-    global telemetry_gas_url
-    try:
-        urls = requests.get(
-            # FIXME: リリース時には置き換える
-            "https://gist.githubusercontent.com/sevenc-nanashi/a92b0d27fa464cf63738a993e8917084/raw/55f597a29d4fdf3ddb93aa684615e48d9415cae0/urls.json"
-        ).json()
-        # telemetry_gas_urlがNoneかどうかでAPIを有効にするかどうかを判断するので、
-        # まだtelemetry_gas_urlを代入しない。
-        tmp_telemetry_gas_url: str = urls["telemetry"]
-        info = requests.get(
-            tmp_telemetry_gas_url,
-        ).json()
-        if info["api_version"] != 1:
-            logger.error(
-                f"Invalid version: API version is {info['api_version']}, expected 1"
-            )
-            raise Exception("Invalid version")
-        logger.info("Telemetry API version: 1, telemetry enabled.")
-        telemetry_gas_url = tmp_telemetry_gas_url
-    except Exception as e:
-        logger.error(f"Failed to telemetry url, {e}, {traceback.format_exc()}")
-
-        telemetry_gas_url = None
 
 
 mutex_user_dict = threading.Lock()
@@ -79,104 +45,76 @@ def write_to_json(user_dict: Dict[str, UserDictWord], user_dict_path: Path):
     user_dict_path.write_text(user_dict_json, encoding="utf-8")
 
 
-# def fetch_shared_dict() -> None:
-#     if shared_dict_gas_url is None:
-#         logger.error("Failed to fetch shared dict, shared_dict_gas_url is None.")
-#         return
-#     logger.info("Fetching shared dict...")
-#     shared_dict = requests.get(
-#         url=shared_dict_gas_url,
-#         headers={"Content-Type": "application/json"},
-#     )
-#     if shared_dict.status_code != 200:
-#         logger.error("Failed to fetch shared dict, %s", shared_dict.status_code)
-#         return
-#     shared_dict_rows = shared_dict.json()
-#     logger.info("Fetched shared dict, %s items.", len(shared_dict.json()))
-#     write_to_json(
-#         {
-#             row[0]: create_word(
-#                 surface=row[1],
-#                 pronunciation=row[2],
-#                 accent_type=int(row[3]),
-#                 word_type=row[4] or None,
-#                 priority=int(row[5]),
-#                 is_shared=True,
-#             )
-#             for row in shared_dict_rows
-#         },
-#         shared_dict_path,
-#     )
-
-#     update_dict()
-
-
 @mutex_wrapper(mutex_openjtalk_dict)
 def update_dict(
     default_dict_path: Path = default_dict_path,
     user_dict_path: Path = user_dict_path,
-    shared_dict_path: Path = shared_dict_path,
     compiled_dict_path: Path = compiled_dict_path,
 ):
-    with NamedTemporaryFile(encoding="utf-8", mode="w", delete=False) as f:
+    random_string = uuid4()
+    tmp_csv_path = save_dir / f".tmp.dict_csv-{random_string}"
+    tmp_compiled_path = save_dir / f".tmp.dict_compiled-{random_string}"
+
+    try:
+        # 辞書.csvを作成
+        csv_text = ""
         if not default_dict_path.is_file():
             print("Warning: Cannot find default dictionary.", file=sys.stderr)
             return
         default_dict = default_dict_path.read_text(encoding="utf-8")
         if default_dict == default_dict.rstrip():
             default_dict += "\n"
-        f.write(default_dict)
+        csv_text += default_dict
         user_dict = read_dict(user_dict_path=user_dict_path)
-        shared_dict = read_dict(user_dict_path=shared_dict_path)
-        for word in (
-            {
-                **user_dict,
-                **shared_dict,
-            }
-        ).values():
-            f.write(
-                (
-                    "{surface},{context_id},{context_id},{cost},{part_of_speech},"
-                    + "{part_of_speech_detail_1},{part_of_speech_detail_2},"
-                    + "{part_of_speech_detail_3},{inflectional_type},"
-                    + "{inflectional_form},{stem},{yomi},{pronunciation},"
-                    + "{accent_type}/{mora_count},{accent_associative_rule}\n"
-                ).format(
-                    surface=word.surface,
-                    context_id=word.context_id,
-                    cost=priority2cost(word.context_id, word.priority),
-                    part_of_speech=word.part_of_speech,
-                    part_of_speech_detail_1=word.part_of_speech_detail_1,
-                    part_of_speech_detail_2=word.part_of_speech_detail_2,
-                    part_of_speech_detail_3=word.part_of_speech_detail_3,
-                    inflectional_type=word.inflectional_type,
-                    inflectional_form=word.inflectional_form,
-                    stem=word.stem,
-                    yomi=word.yomi,
-                    pronunciation=word.pronunciation,
-                    accent_type=word.accent_type,
-                    mora_count=word.mora_count,
-                    accent_associative_rule=word.accent_associative_rule,
-                )
+        for word_uuid in user_dict:
+            word = user_dict[word_uuid]
+            csv_text += (
+                "{surface},{context_id},{context_id},{cost},{part_of_speech},"
+                + "{part_of_speech_detail_1},{part_of_speech_detail_2},"
+                + "{part_of_speech_detail_3},{inflectional_type},"
+                + "{inflectional_form},{stem},{yomi},{pronunciation},"
+                + "{accent_type}/{mora_count},{accent_associative_rule}\n"
+            ).format(
+                surface=word.surface,
+                context_id=word.context_id,
+                cost=priority2cost(word.context_id, word.priority),
+                part_of_speech=word.part_of_speech,
+                part_of_speech_detail_1=word.part_of_speech_detail_1,
+                part_of_speech_detail_2=word.part_of_speech_detail_2,
+                part_of_speech_detail_3=word.part_of_speech_detail_3,
+                inflectional_type=word.inflectional_type,
+                inflectional_form=word.inflectional_form,
+                stem=word.stem,
+                yomi=word.yomi,
+                pronunciation=word.pronunciation,
+                accent_type=word.accent_type,
+                mora_count=word.mora_count,
+                accent_associative_rule=word.accent_associative_rule,
             )
-    tmp_dict_path = Path(NamedTemporaryFile(delete=False).name).resolve()
-    pyopenjtalk.create_user_dict(
-        str(Path(f.name).resolve(strict=True)),
-        str(tmp_dict_path),
-    )
-    delete_file(f.name)
-    if not tmp_dict_path.is_file():
-        raise RuntimeError("辞書のコンパイル時にエラーが発生しました。")
-    pyopenjtalk.unset_user_dict()
-    try:
-        shutil.move(tmp_dict_path, compiled_dict_path)  # ドライブを跨ぐためPath.replaceが使えない
-    except OSError:
-        traceback.print_exc()
-        if tmp_dict_path.exists():
-            delete_file(tmp_dict_path.name)
-    finally:
+        tmp_csv_path.write_text(csv_text, encoding="utf-8")
+
+        # 辞書.csvをOpenJTalk用にコンパイル
+        pyopenjtalk.create_user_dict(str(tmp_csv_path), str(tmp_compiled_path))
+        if not tmp_compiled_path.is_file():
+            raise RuntimeError("辞書のコンパイル時にエラーが発生しました。")
+
+        # コンパイル済み辞書の置き換え・読み込み
+        pyopenjtalk.unset_user_dict()
+        tmp_compiled_path.replace(compiled_dict_path)
         if compiled_dict_path.is_file():
             pyopenjtalk.set_user_dict(str(compiled_dict_path.resolve(strict=True)))
+
+    except Exception as e:
+        print("Error: Failed to update dictionary.", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        raise e
+
+    finally:
+        # 後処理
+        if tmp_csv_path.exists():
+            tmp_csv_path.unlink()
+        if tmp_compiled_path.exists():
+            tmp_compiled_path.unlink()
 
 
 @mutex_wrapper(mutex_user_dict)
@@ -206,7 +144,6 @@ def create_word(
     accent_type: int,
     word_type: Optional[WordTypes] = None,
     priority: Optional[int] = None,
-    is_shared: bool = False,
 ) -> UserDictWord:
     if word_type is None:
         word_type = WordTypes.PROPER_NOUN
@@ -232,8 +169,6 @@ def create_word(
         pronunciation=pronunciation,
         accent_type=accent_type,
         accent_associative_rule="*",
-        mora_count=None,
-        is_shared=is_shared,
     )
 
 
@@ -243,7 +178,6 @@ def apply_word(
     accent_type: int,
     word_type: Optional[WordTypes] = None,
     priority: Optional[int] = None,
-    is_shared: bool = False,
     user_dict_path: Path = user_dict_path,
     compiled_dict_path: Path = compiled_dict_path,
 ) -> str:
@@ -253,25 +187,12 @@ def apply_word(
         accent_type=accent_type,
         word_type=word_type,
         priority=priority,
-        is_shared=is_shared,
     )
     user_dict = read_dict(user_dict_path=user_dict_path)
     word_uuid = str(uuid4())
     user_dict[word_uuid] = word
     write_to_json(user_dict, user_dict_path)
     update_dict(user_dict_path=user_dict_path, compiled_dict_path=compiled_dict_path)
-    if is_shared:
-        send_telemetry(
-            "apply_word",
-            {
-                "word_uuid": word_uuid,
-                "surface": surface,
-                "pronunciation": pronunciation,
-                "accent_type": accent_type,
-                "word_type": word_type,
-                "priority": priority,
-            },
-        )
     return word_uuid
 
 
@@ -282,7 +203,6 @@ def rewrite_word(
     accent_type: int,
     word_type: Optional[WordTypes] = None,
     priority: Optional[int] = None,
-    is_shared: bool = False,
     user_dict_path: Path = user_dict_path,
     compiled_dict_path: Path = compiled_dict_path,
 ):
@@ -292,31 +212,10 @@ def rewrite_word(
         accent_type=accent_type,
         word_type=word_type,
         priority=priority,
-        is_shared=is_shared,
     )
     user_dict = read_dict(user_dict_path=user_dict_path)
     if word_uuid not in user_dict:
         raise HTTPException(status_code=422, detail="UUIDに該当するワードが見つかりませんでした")
-    if user_dict[word_uuid].is_shared and not is_shared:
-        send_telemetry(
-            "delete_word",
-            {
-                "word_uuid": word_uuid,
-            },
-        )
-    elif is_shared:
-        send_telemetry(
-            "rewrite_word" if user_dict[word_uuid].is_shared else "apply_word",
-            {
-                "word_uuid": word_uuid,
-                "surface": surface,
-                "pronunciation": pronunciation,
-                "accent_type": accent_type,
-                "word_type": word_type,
-                "priority": priority,
-            },
-        )
-
     user_dict[word_uuid] = word
     write_to_json(user_dict, user_dict_path)
     update_dict(user_dict_path=user_dict_path, compiled_dict_path=compiled_dict_path)
@@ -330,11 +229,6 @@ def delete_word(
     user_dict = read_dict(user_dict_path=user_dict_path)
     if word_uuid not in user_dict:
         raise HTTPException(status_code=422, detail="IDに該当するワードが見つかりませんでした")
-    if user_dict[word_uuid].is_shared:
-        send_telemetry(
-            "delete_word",
-            {"word_uuid": word_uuid},
-        )
     del user_dict[word_uuid]
     write_to_json(user_dict, user_dict_path)
     update_dict(user_dict_path=user_dict_path, compiled_dict_path=compiled_dict_path)
@@ -402,27 +296,3 @@ def priority2cost(
 ) -> int:
     cost_candidates = search_cost_candidates(context_id)
     return cost_candidates[MAX_PRIORITY - priority]
-
-
-def send_telemetry(event, properties):
-    if telemetry_gas_url is None:
-        return
-    logger = getLogger("uvicorn")
-    logger.info(f"send telemetry: {event}, {properties}")
-
-    def run():
-        request = requests.Request(
-            "POST",
-            telemetry_gas_url,
-            json={
-                "event": event,
-                "properties": properties,
-            },
-        )
-        result = requests.Session().send(request.prepare())
-        if result.text == "ok":
-            logger.info("telemetry sent successfully")
-        else:
-            logger.error(f"telemetry sending failed: {result.text}")
-
-    threading.Thread(target=run).start()
